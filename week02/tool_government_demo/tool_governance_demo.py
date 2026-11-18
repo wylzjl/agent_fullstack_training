@@ -80,16 +80,15 @@ class ExecutionContext:
     approval_id: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class ToolPolicy:
-    effect: Effect
-    risk: Risk
-    permission: Permission
-    requires_approval: bool
-    timeout_seconds: float
-    max_retries: int
-    idempotent: bool
-
+@dataclass(frozen=True, slots=True) 
+class ToolPolicy: # 每个工具的治理策略声明
+    effect: Effect            # READ / WRITE / SHELL —— 副作用类型
+    risk: Risk                # LOW / MEDIUM / HIGH —— 风险等级
+    permission: Permission    # 需要的业务权限（RBAC 用）
+    requires_approval: bool   # 是否强制人工审批
+    timeout_seconds: float    # 执行超时
+    max_retries: int          # 最大重试次数
+    idempotent: bool          # 是否幂等
 
 class StrictArgs(BaseModel):
     """模型只能提交 Schema 允许的业务候选参数。"""
@@ -119,6 +118,9 @@ class RunShellArgs(StrictArgs):
 # 参考上面的 CreateRefundArgs 怎么写 Field 约束。
 class TransferArgs(StrictArgs):
     """TODO(任务 2)：补全 from_account / to_account / amount 三个字段。"""
+    from_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
+    to_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
+    amount: float = Field(gt=0, le=100_000)
 
 
 ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs | TransferArgs
@@ -151,10 +153,11 @@ class ToolDefinition:
 
 
 @dataclass(frozen=True, slots=True)
-class PermissionRule:
-    effect: Literal["allow", "deny"]
-    tool_name: str
-    target_prefix: str | None = None
+class PermissionRule: # 唯一用配置表达"硬拒绝"和"显式放行"的数据结构
+    effect: Literal["allow", "deny"]   # 规则效果
+    tool_name: str                      # 针对哪个工具
+    target_prefix: str | None = None    # 针对哪个目标（可选）
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +332,7 @@ def _redact(value: Any) -> Any:
         # ===== TODO(任务 6)：在这里追加账号脱敏 =====
         # 把 ACC-A-123456 变成 ACC-A-****3456（保留字符前缀与末 4 位）。
         # 提示：re.sub 的替换既可以是字符串，也可以是函数，两种都行。
+        value = re.sub(r"ACC-[A-Z]-\d{6}", lambda m: m.group(0)[:6] + "****" + m.group(0)[-4:], value)
         return value
     return value
 
@@ -632,7 +636,12 @@ ORDERS = {
 #   ("tenant_a", "ACC-A-888888"): 20_000.0
 #   ("tenant_b", "ACC-B-111111"): 50_000.0
 # 注意：ACCOUNTS 是模块级可变状态，测试会按用例快照还原，所以必须写成可变的 dict。
-ACCOUNTS: dict[tuple[str, str], float] = {}
+ACCOUNTS: dict[tuple[str, str], float] = {
+    ("tenant_a", "ACC-A-123456"): 100_000.0,
+    ("tenant_a", "ACC-A-654321"): 5_000.0,
+    ("tenant_a", "ACC-A-888888"): 20_000.0,
+    ("tenant_b", "ACC-B-111111"): 50_000.0
+}
 SIDE_EFFECTS = {"refund_executions": 0, "shell_executions": 0}
 
 
@@ -672,7 +681,15 @@ async def refund_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -
 #   2. 从 ACCOUNTS 查 (context.tenant_id, from_account) 的余额，小于 amount
 #      → PolicyDenied("INSUFFICIENT_BALANCE", ...)
 async def transfer_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -> None:
-    raise NotImplementedError("TODO(任务 3)：请实现 transfer_precheck")
+    # raise NotImplementedError("TODO(任务 3)：请实现 transfer_precheck")
+    arguments = raw_arguments
+    assert isinstance(arguments, TransferArgs)
+    # 1. 金额落进教学拦截区间 50000 < amount <= 80000 → PolicyDenied("EXCEED_LIMIT", ...)
+    if 50000 < arguments.amount <= 80000:
+        raise PolicyDenied("EXCEED_LIMIT", "转账金额超过教学拦截区间")
+    # 2. 从 ACCOUNTS 查 (context.tenant_id, from_account) 的余额，小于 amount → PolicyDenied("INSUFFICIENT_BALANCE", ...)
+    if ACCOUNTS.get((context.tenant_id, arguments.from_account), 0) < arguments.amount:
+        raise PolicyDenied("INSUFFICIENT_BALANCE", "转出账户余额不足")
 
 
 async def create_refund_handler(
@@ -706,7 +723,26 @@ async def transfer_handler(
     raw_arguments: ArgsModel,
     context: ExecutionContext,
 ) -> Mapping[str, Any]:
-    raise NotImplementedError("TODO(任务 4)：请实现 transfer_handler")
+    # raise NotImplementedError("TODO(任务 4)：请实现 transfer_handler")
+    arguments = raw_arguments
+    assert isinstance(arguments, TransferArgs)
+    # 1. 超时模拟：amount > 80000 时先 await asyncio.sleep(3.0)
+    if arguments.amount > 80000:
+        await asyncio.sleep(3.0)
+    # 2. 转入账户不存在 → raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")
+    if (context.tenant_id, arguments.to_account) not in ACCOUNTS:
+        raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")
+    # 3. 改余额：转出账户扣 amount，转入账户加 amount。
+    ACCOUNTS[(context.tenant_id, arguments.from_account)] -= arguments.amount
+    ACCOUNTS[(context.tenant_id, arguments.to_account)] += arguments.amount
+    # 4. 返回 dict：txn_id（tool_call_id 后 6 位）、 from、to、amount、status="accepted"。
+    return {
+        "txn_id": tool_call_id[-6:],
+        "from": arguments.from_account,
+        "to": arguments.to_account,
+        "amount": arguments.amount,
+        "status": "accepted",
+    }
 
 
 async def simulated_shell_handler(
@@ -760,6 +796,15 @@ def build_tools() -> list[ToolDefinition]:
         #   policy 参考同类写操作工具：Effect.WRITE、应当需要人工审批、
         #   permission 用 "transfer:execute"、非幂等、max_retries=0；
         #   timeout_seconds 必须小于任务 4 里超时演示的 3 秒。
+        ToolDefinition(
+            name="transfer",
+            description="执行账户间的资金转账操作",
+            parameters_model=TransferArgs,
+            policy=ToolPolicy(Effect.WRITE, Risk.HIGH, "transfer:execute", True, 2.0, 0, False),
+            handler=transfer_handler,
+            precheck=transfer_precheck,
+            canonical_target=lambda args: f"{getattr(args, 'from_account')}->{getattr(args, 'to_account')}:{getattr(args, 'amount')}",
+        )
     ]
 
 
@@ -776,8 +821,8 @@ def base_context(**overrides: Any) -> ExecutionContext:
         user_id="u_100",
         tenant_id="tenant_a",
         mode=PermissionMode.DEFAULT,
-        permissions=frozenset({"order:read", "refund:create", "shell:run"}),
-        allowed_tools=frozenset({"get_order", "create_refund", "run_shell"}),
+        permissions=frozenset({"order:read", "refund:create", "shell:run", "transfer:execute"}),
+        allowed_tools=frozenset({"get_order", "create_refund", "run_shell", "transfer"}),
     )
     return replace(context, **overrides)
 
@@ -853,10 +898,11 @@ async def run_deepseek_agent(user_input: str) -> None:
     if not api_key:
         raise RuntimeError("请先设置环境变量 DEEPSEEK_API_KEY")
 
-    runtime, _, _ = build_runtime()
-    context = base_context(allowed_tools=frozenset({"get_order"}))
+    runtime, approvals, _ = build_runtime()
+    context = base_context(allowed_tools=frozenset({"get_order", "transfer"}))
     client = AsyncOpenAI(api_key=api_key, base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
     model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    approvals.approve('approval_transfer_01', context, 'transfer', {'from_account': 'ACC-A-123456', 'to_account': 'ACC-A-888888', 'amount': 100.0})
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
@@ -864,7 +910,7 @@ async def run_deepseek_agent(user_input: str) -> None:
         },
         {"role": "user", "content": user_input},
     ]
-
+    
     for _round in range(8):
         stream = await client.chat.completions.create(
             model=model,
@@ -915,7 +961,8 @@ async def run_deepseek_agent(user_input: str) -> None:
                 raw_arguments = {"_invalid_json": provider_call["function"]["arguments"]}
             result = await runtime.invoke(
                 ToolCall(provider_call["id"], provider_call["function"]["name"], raw_arguments),
-                context,
+                # context,
+                replace(context, approval_id="approval_transfer_01"),
             )
             print(f"[tool_result] {result.tool_name} {result.code}")
             messages.append(result.to_tool_message())
